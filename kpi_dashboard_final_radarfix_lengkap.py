@@ -349,7 +349,7 @@ else:
     # 1. Tampilkan gambar ilustrasi
     try:
         explanation_img = Image.open("image.png")
-        st.image(explanation_img, caption="Penjelasan Z-Score & Nine Box Classification", use_column_width=True)
+        st.image(explanation_img, caption="Penjelasan Z-Score & Nine Box Classification", use_container_width=True)
     except:
         st.warning("Gambar penjelasan tidak ditemukan. Pastikan 'image.png' ada di folder yang sama.")
 

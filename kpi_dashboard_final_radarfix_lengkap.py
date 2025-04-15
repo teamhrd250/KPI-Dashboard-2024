@@ -6,8 +6,8 @@ from PIL import Image
 
 # Simulasi data user yang terdaftar
 users_db = {
-    'admin': {'password': 'admin123'},
-    'user1': {'password': 'user123'},
+    'admin': {'password': 'sikasep123'},
+    'user1': {'password': 'simanis123'},
 }
 
 # Fungsi untuk login

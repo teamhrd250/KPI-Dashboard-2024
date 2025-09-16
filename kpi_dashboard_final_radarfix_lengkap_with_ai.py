@@ -7,11 +7,15 @@ import openai
 from gtts import gTTS
 import os
 
-# =============== LOGIN SYSTEM ===============
-if 'logged_in' not in st.session_state:
-    st.session_state.logged_in = False
+# Simulasi data user yang terdaftar
+users_db = {
+    'admin': {'password': 'sikasep123'},
+    'user1': {'password': 'simanis123'},
+}
 
-if not st.session_state.logged_in:
+
+# Fungsi untuk login
+def login():
     col1, col2, col3 = st.columns([1, 2, 1])
     with col2:
         logo = Image.open("logo.png")
@@ -19,13 +23,14 @@ if not st.session_state.logged_in:
         st.markdown("## Login")
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
+        
         if st.button("Login"):
-            if username == "admin" and password == "123":
+            if username in users_db and users_db[username]['password'] == password:
                 st.session_state.logged_in = True
-                st.experimental_rerun()
+                st.session_state.username = username
+                st.success(f"Welcome {username}!")
             else:
-                st.error("Username atau Password salah!")
-
+                st.error("Invalid credentials, please try again.")
 # =============== MAIN CONTENT ===============
 else:
     st.set_page_config(page_title="Dashboard KPI + Voice AI", layout="wide")

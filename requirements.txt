@@ -1,0 +1,6 @@
+streamlit
+streamlit-webrtc
+openai
+plotly
+pandas
+pillow

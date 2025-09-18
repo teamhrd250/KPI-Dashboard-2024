@@ -1,8 +1,0 @@
-streamlit
-pandas
-openai
-gTTS
-plotly
-openpyxl
-Pillow
-fpdf

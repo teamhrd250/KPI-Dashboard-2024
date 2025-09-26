@@ -1,0 +1,7 @@
+streamlit
+gTTS
+pandas
+plotly
+openpyxl
+Pillow
+fpdf

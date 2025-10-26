@@ -1,0 +1,312 @@
+# app.py
+# Streamlit HR Dashboard + AI Voice Presenter (auto‑narration + voice answers)
+# -------------------------------------------------------------
+# Fitur utama:
+# 1) Presentasi otomatis: AI merangkum insight dashboard lalu menyuarakannya (gTTS)
+# 2) Q&A interaktif: ketik pertanyaan atau pakai voice (opsional), AI jawab lalu dibacakan suara
+# 3) Ambil data HR dari file lokal / URL GitHub (CSV/XLSX)
+#
+# Catatan:
+# - Untuk TTS dipakai gTTS (tanpa API key). Perlu koneksi internet.
+# - Untuk STT (speech to text) opsi termudah adalah streamlit-webrtc + Whisper API (atau Vosk local). Di bawah disiapkan blok opsional.
+# - Untuk jawaban AI, contoh ini gunakan OpenAI API (set env OPENAI_API_KEY). Bisa ganti model/provider sesuai preferensi.
+#
+# Requirements (requirements.txt):
+# streamlit==1.39.0
+# pandas
+# numpy
+# plotly
+# gTTS
+# pydub
+# openai>=1.40.0
+# # opsional (untuk voice input real-time):
+# streamlit-webrtc
+# av
+# faster-whisper  # atau pakai OpenAI Whisper API saja
+# vosk            # alternatif STT offline (butuh model ID)
+#
+# Cara jalanin:
+#   streamlit run app.py
+# -------------------------------------------------------------
+
+import os
+import io
+import time
+from datetime import datetime
+
+import streamlit as st
+import pandas as pd
+import numpy as np
+import plotly.express as px
+from gtts import gTTS
+from pydub import AudioSegment
+from pydub.playback import play  # (tidak dipakai; audio diputar via st.audio)
+
+# ==== (Opsional) WebRTC untuk mic ==== #
+ENABLE_WEBRTC = False
+try:
+    import av  # noqa: F401
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+    ENABLE_WEBRTC = True
+except Exception:
+    ENABLE_WEBRTC = False
+
+# ==== OpenAI client (untuk teks jawaban & narasi) ====
+try:
+    from openai import OpenAI
+    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+    client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    client = None
+
+st.set_page_config(
+    page_title="HR Dashboard + AI Voice Presenter",
+    page_icon="🎤",
+    layout="wide",
+)
+
+# -------------- Helpers -------------- #
+@st.cache_data(show_spinner=False)
+def load_data_from_source(uploaded_file, github_raw_url: str):
+    """Load CSV/XLSX HR dataset from uploaded file or GitHub raw URL.
+    Expected minimal columns (contoh): ['Name','Dept','Grade','KPI','Absence','JoinDate']
+    """
+    df = None
+    if uploaded_file is not None:
+        if uploaded_file.name.lower().endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
+        elif uploaded_file.name.lower().endswith((".xlsx", ".xls")):
+            df = pd.read_excel(uploaded_file)
+    elif github_raw_url:
+        if github_raw_url.endswith(".csv"):
+            df = pd.read_csv(github_raw_url)
+        elif github_raw_url.endswith((".xlsx", ".xls")):
+            df = pd.read_excel(github_raw_url)
+    # fallback demo data
+    if df is None or df.empty:
+        rng = np.random.default_rng(42)
+        n = 120
+        df = pd.DataFrame({
+            "Name": [f"Emp-{i:03d}" for i in range(1, n + 1)],
+            "Dept": rng.choice(["GA","HR","IT","Finance","Ops","Sales"], size=n),
+            "Grade": rng.choice(["Staff","Senior","Lead","Manager"], size=n, p=[0.45,0.3,0.2,0.05]),
+            "KPI": np.clip(rng.normal(78, 8, size=n), 40, 100).round(1),
+            "Absence": np.clip(rng.normal(3.2, 1.5, size=n), 0, 15).round(1),
+            "JoinDate": pd.to_datetime(rng.choice(pd.date_range("2017-01-01","2025-01-01"), size=n)),
+        })
+    # derived
+    df["Year"] = pd.to_datetime(df["JoinDate"]).dt.year
+    return df
+
+
+def tts_bytes(text: str, lang: str = "id") -> bytes:
+    """Generate TTS MP3 bytes using gTTS and return as bytes."""
+    if not text.strip():
+        text = "Tidak ada konten untuk dibacakan."
+    tts = gTTS(text=text, lang=lang)
+    buf = io.BytesIO()
+    tts.write_to_fp(buf)
+    return buf.getvalue()
+
+
+def ai_summarize(df: pd.DataFrame, extra_prompt: str = "") -> str:
+    """Minta AI merangkum insight. Jika API tidak tersedia, pakai template rule‑based."""
+    # quick stats
+    by_dept = df.groupby("Dept").agg(
+        n=("Name","count"),
+        kpi_mean=("KPI","mean"),
+        abs_mean=("Absence","mean"),
+    ).reset_index()
+    top_dept = by_dept.sort_values("kpi_mean", ascending=False).iloc[0]
+    worst_dept = by_dept.sort_values("kpi_mean", ascending=True).iloc[0]
+    overall = {
+        "n": len(df),
+        "kpi_mean": float(df["KPI"].mean()),
+        "abs_mean": float(df["Absence"].mean()),
+        "mgr_ratio": float((df["Grade"] == "Manager").mean()),
+    }
+
+    system_prompt = (
+        "You are an HR analytics presenter. Speak concisely in Bahasa Indonesia, "
+        "friendly, like a conference MC. Mention 3–5 bullets: overall KPI & absence, "
+        "best/worst department, and 1 actionable recommendation. Keep it under 100 seconds."
+    )
+
+    user_msg = f"""
+Data ringkas:
+- Jumlah karyawan = {overall['n']}
+- Rata-rata KPI = {overall['kpi_mean']:.1f}
+- Rata-rata ketidakhadiran = {overall['abs_mean']:.1f} hari
+- Rasio Manager = {overall['mgr_ratio']*100:.1f}%
+- Dept terbaik KPI = {top_dept['Dept']} ({top_dept['kpi_mean']:.1f})
+- Dept terendah KPI = {worst_dept['Dept']} ({worst_dept['kpi_mean']:.1f})
+{extra_prompt}
+"""
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":system_prompt},
+                    {"role":"user","content":user_msg}
+                ],
+                temperature=0.7,
+                max_tokens=400,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            st.warning(f"Gagal memanggil API AI: {e}. Pakai ringkasan sederhana.")
+    # fallback template
+    return (
+        "Halo! Berikut highlight HR kita: \n"
+        f"• Rata-rata KPI {overall['kpi_mean']:.1f} dengan {overall['n']} karyawan. \n"
+        f"• Ketidakhadiran rata-rata {overall['abs_mean']:.1f} hari. \n"
+        f"• Dept terbaik: {top_dept['Dept']} (KPI {top_dept['kpi_mean']:.1f}). \n"
+        f"• Perlu perhatian: {worst_dept['Dept']} (KPI {worst_dept['kpi_mean']:.1f}). \n"
+        "Rekomendasi: lakukan coaching mingguan di dept terendah dan pairing mentor dari dept terbaik."
+    )
+
+
+def ai_answer(question: str, context_hint: str = "") -> str:
+    if not question.strip():
+        return "Silakan ajukan pertanyaan dulu ya."
+    if client:
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[
+                    {"role":"system","content":(
+                        "Kamu adalah asisten AI HR analytics. Jawab singkat, jelas, dan actionable. "
+                        "Gunakan Bahasa Indonesia. Jika butuh angka yang belum ada, katakan asumsi atau minta data.")},
+                    {"role":"user","content":f"Konteks: {context_hint}\nPertanyaan: {question}"}
+                ],
+                temperature=0.4,
+                max_tokens=300,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            return f"(Gagal memanggil AI: {e})"
+    return "(AI offline) Jawaban otomatis belum aktif. Set OPENAI_API_KEY untuk mengaktifkan."
+
+
+# -------------- UI -------------- #
+st.title("🎤 HR Dashboard + AI Voice Presenter")
+st.caption("Template oleh AI — siap disesuaikan dengan dataset HR kamu.")
+
+with st.sidebar:
+    st.header("Data Source")
+    github_url = st.text_input("GitHub Raw URL (CSV/XLSX)", placeholder="https://raw.githubusercontent.com/<user>/<repo>/main/data/hr.csv")
+    up = st.file_uploader("Atau upload file CSV/XLSX", type=["csv","xlsx","xls"])
+    lang = st.selectbox("Bahasa voiceover", ["id","en"], index=0)
+    st.divider()
+    st.subheader("AI Settings")
+    st.write("Model text: OpenAI (gpt-4o-mini). Set env OPENAI_API_KEY.")
+    st.caption("Jika tidak diset, akan pakai ringkasan lokal sederhana.")
+
+# Data
+df = load_data_from_source(up, github_url)
+
+# Filters (contoh sederhana)
+colf1, colf2, colf3 = st.columns(3)
+with colf1:
+    dept_opt = ["ALL"] + sorted(df["Dept"].unique().tolist())
+    dept_sel = st.selectbox("Departemen", dept_opt, index=0)
+with colf2:
+    grade_opt = ["ALL"] + sorted(df["Grade"].unique().tolist())
+    grade_sel = st.selectbox("Grade", grade_opt, index=0)
+with colf3:
+    year_min, year_max = int(df["Year"].min()), int(df["Year"].max())
+    year_rng = st.slider("Join Year", min_value=year_min, max_value=year_max, value=(year_min, year_max))
+
+mask = (
+    ((df["Dept"] == dept_sel) | (dept_sel == "ALL")) &
+    ((df["Grade"] == grade_sel) | (grade_sel == "ALL")) &
+    (df["Year"].between(year_rng[0], year_rng[1]))
+)
+view = df[mask].copy()
+
+# KPI cards
+kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+with kpi1:
+    st.metric("Jumlah Karyawan", len(view))
+with kpi2:
+    st.metric("Rata-rata KPI", f"{view['KPI'].mean():.1f}")
+with kpi3:
+    st.metric("Rata-rata Absence (hari)", f"{view['Absence'].mean():.1f}")
+with kpi4:
+    st.metric("% Manager", f"{(view['Grade'].eq('Manager').mean()*100):.1f}%")
+
+# Charts
+c1, c2 = st.columns(2)
+with c1:
+    fig1 = px.box(view, x="Dept", y="KPI", points="all", title="Distribusi KPI per Dept")
+    st.plotly_chart(fig1, use_container_width=True)
+with c2:
+    fig2 = px.histogram(view, x="Absence", nbins=20, title="Sebaran Ketidakhadiran (hari)")
+    st.plotly_chart(fig2, use_container_width=True)
+
+c3, c4 = st.columns(2)
+with c3:
+    fig3 = px.scatter(view, x="Absence", y="KPI", color="Dept", hover_data=["Name","Grade"], trendline="ols", title="Absence vs KPI")
+    st.plotly_chart(fig3, use_container_width=True)
+with c4:
+    trend = view.groupby("Year").agg(KPI_mean=("KPI","mean")).reset_index()
+    fig4 = px.line(trend, x="Year", y="KPI_mean", markers=True, title="Trend KPI per Tahun")
+    st.plotly_chart(fig4, use_container_width=True)
+
+st.divider()
+
+# ====== PRESENTASI OTOMATIS ======
+st.subheader("🎬 Presentasi Otomatis (AI Voiceover)")
+colp1, colp2 = st.columns([2,1])
+with colp1:
+    extra = st.text_area("Tambahkan konteks (opsional)", placeholder="Misal: fokus pada divisi Sales Q3, rencana coaching minggu depan, dll.")
+with colp2:
+    start = st.button("Mulai Presentasi 🔊")
+
+if start:
+    with st.spinner("Menyusun narasi AI..."):
+        script = ai_summarize(view, extra_prompt=extra)
+        st.write("**Naskah Voiceover:**")
+        st.write(script)
+        audio_bytes = tts_bytes(script, lang=lang)
+        st.audio(audio_bytes, format="audio/mp3")
+
+st.divider()
+
+# ====== Q&A INTERAKTIF ======
+st.subheader("🗣️ Tanya-Jawab (AI akan menjawab dengan suara)")
+qcol1, qcol2 = st.columns([3,1])
+with qcol1:
+    question = st.text_input("Ketik pertanyaan (bahasa Indonesia/Inggris)", placeholder="Contoh: Divisi mana yang perlu coaching segera dan kenapa?")
+with qcol2:
+    ask = st.button("Tanya & Dengar Jawaban 🎧")
+
+if ask:
+    with st.spinner("AI sedang menyiapkan jawaban..."):
+        context_hint = f"Filter: Dept={dept_sel}, Grade={grade_sel}, Year={year_rng}. Jumlah baris={len(view)}."
+        answer = ai_answer(question, context_hint=context_hint)
+        st.write("**Jawaban AI:**")
+        st.write(answer)
+        answer_audio = tts_bytes(answer, lang=lang)
+        st.audio(answer_audio, format="audio/mp3")
+
+# ====== (OPSIONAL) Voice input realtime dengan WebRTC ======
+with st.expander("Mic Input Realtime (opsional)"):
+    st.caption("Aktifkan jika paket streamlit-webrtc terpasang. Cocok untuk Q&A via suara langsung.")
+    if ENABLE_WEBRTC:
+        rtc_config = RTCConfiguration({
+            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
+        })
+        st.info("Contoh ini hanya menangkap audio mikrofon. Untuk transkripsi, integrasikan ke Whisper API atau Vosk.")
+        webrtc_streamer(key="audio-only", mode=WebRtcMode.SENDRECV, rtc_configuration=rtc_config, media_stream_constraints={"audio": True, "video": False})
+        st.markdown("""
+        **Langkah integrasi STT:**
+        1. Kirim frame audio ke backend, buffer ~5–10 detik.
+        2. Panggil OpenAI Whisper API / Vosk untuk transkripsi (id/en).
+        3. Kirim teks ke `ai_answer()` -> hasilkan suara dengan `gTTS` -> `st.audio`.
+        """)
+    else:
+        st.warning("streamlit-webrtc belum terpasang. Tambahkan ke requirements.txt untuk enable.")
+
+st.caption(f"Build time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
